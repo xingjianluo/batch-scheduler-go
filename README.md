@@ -183,7 +183,75 @@ s.Close()
 
 ---
 
-## 6. 验证方法
+## 6. 调度推演（先推演再决定）
+
+推演用于容量规划与故障复盘：从**当前正在运行的调度器**或**一个已保存的状态点**出发，
+按顺序喂一段事件（提交/完成/取消/推进时间），在独立副本上先跑一遍，看清最终哪些作业
+在运行、哪些在排队、哪些被拒绝以及为什么、中间是否发生抢占、每一步的判断依据——
+全程**不打扰原调度器**。
+
+### 6.1 用法
+
+```go
+// 出发点二选一（SimConfig 的容量/老化参数需与出发点调度器一致）：
+sim, _ := scheduler.NewSimulatorFromScheduler(live, scheduler.SimConfig{
+    Capacity:     scheduler.Resource{CPU: 8, Memory: 16384, GPU: 2},
+    AgeIncrement: 1, AgingPeriod: 10 * time.Second,
+    WorkDir:      "./sim-run-1",            // 检查点目录；为空则纯内存（不可续跑）
+    StartTime:    time.Now(),               // 逻辑时钟起点
+})
+// 或者从已保存的状态文件出发（该文件只读，绝不回写）：
+sim, _ = scheduler.NewSimulator(scheduler.SimConfig{...}, tenants, "./data/state.json")
+
+rec, err := sim.Apply(scheduler.SubmitEvent("job-9", "team-a", 5, scheduler.Resource{CPU: 2}))
+sim.Apply(scheduler.AdvanceEvent(start.Add(time.Hour))) // 推进逻辑时间并触发一轮调度
+sim.Apply(scheduler.CompleteEvent("job-1"))
+sim.Apply(scheduler.CancelEvent("job-2"))
+```
+
+每个 `Apply` 返回 `StepRecord`：事件序号、执行时的逻辑时间、提交拒绝类别
+（`RejectKind`，与真实提交完全同构）、操作错误、本步全部调度裁决（含抢占级联与
+牺牲品列表）、以及本步生效后的完整快照。`sim.Records()` 可取回全部步骤。
+
+### 6.2 推演与真跑的一致性
+
+推演器内部**直接使用同一套 `Scheduler` 实现**，只替换两个外部依赖：时钟换成逻辑
+时钟、存储换成推演自己的检查点。系统中不存在第二份调度逻辑，因此同一段事件序列，
+推演结论与真实按同样顺序操作的结论**逐项一致**（拒绝类别、裁决链、每步后的作业
+状态/队列/资源账）。这一性质由 `TestSimulationMatchesRealRun` 逐步比对保证。
+
+### 6.3 逻辑时间与真实时间
+
+- 所有与时间有关的判断（排队等待、老化提升）只按**调用方推进的逻辑时间**计算：
+  `AdvanceEvent(t)` 把逻辑时钟拨到 `t`（不允许倒退），提交/完成/取消都发生在当前
+  逻辑时刻。
+- 真实过了多久**不影响**结论：同一段事件，瞬间跑完或隔几秒分几次跑，结果完全一致
+  （`TestSimulationLogicalTimeOnly`）。
+- 提交、结束、推进时间任意穿插时，资源账始终不超集群容量、不超租户配额，同一作业
+  不会被排进去两次（每个测试步后都有不变量校验）。
+
+### 6.4 中断续跑与失败语义
+
+- 设置 `WorkDir` 后，每一步生效都会把「调度器状态 + 已生效步骤 + 逻辑时间」原子
+  写入 `WorkDir/sim-checkpoint.json`（与调度器状态存储同款 tmp+fsync+rename）。
+- 进程被杀后用 `ResumeSimulator(cfg)` 从最近一次落盘的检查点接着跑，最终结论与
+  一口气跑完**完全一致**（`TestSimulationResumeNoDrift` 在每个可能的中断点验证）。
+- 每一步**要么彻底生效，要么对外就当没发生过**：检查点落盘失败时 `Apply` 返回错误，
+  内存状态回滚到上一步，重启后也看不到这步的痕迹；原样重试同一步不会多占资源、
+  不会让队列或状态错位（`TestSimulationSaveFailureSemantics`）。
+- 提交被拒、作业不存在等属于**正常推演结论**（记录在 `StepRecord` 中并正常生效），
+  只有落盘失败才会让 `Apply` 返回错误。
+
+### 6.5 与已有保存数据的兼容
+
+- 调度器状态文件（`state.json`）的格式**没有任何变化**：既有保存数据可直接作为
+  推演的出发点（`NewSimulator` 的 `seedStatePath`），原调度器的崩溃恢复行为不受影响。
+- 推演对种子文件**只读**；推演的检查点是独立文件（`sim-checkpoint.json`），与调度器
+  状态文件互不干扰；纯内存模式（`WorkDir: ""`）不落任何文件。
+
+---
+
+## 7. 验证方法
 
 ```bash
 # 构建与静态检查
@@ -198,6 +266,7 @@ go test ./... -race -run 'TestSubmitRejectReasons|TestQuotaBoundary|TestClusterC
 go test ./... -race -run 'TestConcurrent'    # 并发提交、无超卖、重复占位
 go test ./... -race -run 'TestPriority|TestEqual|TestFIFO|TestAging|TestMinimalVictim|TestPreempted' # 抢占/回退/防饿死/确定性
 go test ./... -race -run 'TestCrash|TestRecovery' # 崩溃恢复
+go test ./... -race -run 'TestSimulat'            # 推演：真跑对齐/逻辑时间/续跑/失败语义
 ```
 
 ### 测试场景清单
@@ -220,10 +289,19 @@ go test ./... -race -run 'TestCrash|TestRecovery' # 崩溃恢复
 | `TestCrashRecovery` | 运行/排队/终态/占位崩溃前后一致，终态不再调度 |
 | `TestRecoverySubmitSeq` | 提交序号跨重启延续 |
 | `TestRecoveryUnderConcurrentLoad` | 并发负载后崩溃，磁盘状态自洽、无超卖无重复 |
+| `TestSimulationMatchesRealRun` | 推演与真实运行逐步逐项一致（拒绝类别/裁决链/每步快照） |
+| `TestSimulationLogicalTimeOnly` | 结论只依赖逻辑时间，与真实流逝时间无关 |
+| `TestSimulationResumeNoDrift` | 在每个中断点杀掉续跑，逐步记录与基准完全一致 |
+| `TestSimulationResumeMultipleKills` | 反复多次中断续跑结论不漂移 |
+| `TestSimulationSaveFailureSemantics` | 落盘失败=步骤未发生（内存回滚/重启无痕迹/重试不多占资源） |
+| `TestSimulationSaveFailureOnMutationStep` | 完成+级联调度步骤落盘失败可完整回滚 |
+| `TestSimulationInitCommitFailure` / `TestSimulatorEdgeCases` | 初始提交失败、时间倒退、重复创建、关闭后使用 |
+| `TestSimulationFromSavedStateFile` | 从既有保存状态出发=真实重启续跑，种子文件只读 |
+| `TestSimulationFromLiveScheduler` | 从运行中调度器出发不打扰原调度器，同序结论一致 |
 
 ---
 
-## 7. 包结构
+## 8. 包结构
 
 ```
 pkg/scheduler/
@@ -231,7 +309,8 @@ pkg/scheduler/
   errors.go      # 可区分的提交拒绝错误与哨兵错误
   resource.go    # 三维资源的加减与容量判定
   pool.go        # 进程内资源池（集群用量 + 各租户用量记账）
-  store.go       # 持久化接口 + JSON 原子写文件存储
+  store.go       # 持久化接口 + JSON 原子写文件存储 + 内存存储
   scheduler.go   # 准入、老化排序、抢占、调度固定点与崩溃恢复
+  simulator.go   # 调度推演：事件重放、逻辑时钟、检查点与中断续跑
   *_test.go      # 上述全部场景测试
 ```

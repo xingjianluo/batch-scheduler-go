@@ -50,6 +50,12 @@ func New(cfg Config, tenants []Tenant) (*Scheduler, error) {
 	if err != nil {
 		return nil, err
 	}
+	return newWithStore(cfg, tenants, store)
+}
+
+// newWithStore 与 New 相同，但使用调用方给定的存储实现
+// （推演器借此把内部调度器接到内存存储上，复用同一套调度与恢复逻辑）。
+func newWithStore(cfg Config, tenants []Tenant, store Store) (*Scheduler, error) {
 	clock := cfg.Clock
 	if clock == nil {
 		clock = systemClock{}
@@ -231,6 +237,19 @@ func (s *Scheduler) Submit(id, tenantID string, priority int, req Resource) (*Su
 func (s *Scheduler) Complete(jobID string) (*Decision, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	decisions, err := s.completeLocked(jobID)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.persistLocked(); err != nil {
+		return nil, err
+	}
+	return &decisions[0], nil
+}
+
+// completeLocked 是 Complete 的持锁实现，返回本步全部裁决（含后续调度级联），
+// 供推演器记录完整的判断依据。
+func (s *Scheduler) completeLocked(jobID string) ([]Decision, error) {
 	job, ok := s.jobs[jobID]
 	if !ok {
 		return nil, ErrJobNotFound
@@ -252,16 +271,25 @@ func (s *Scheduler) Complete(jobID string) (*Decision, error) {
 	}
 	decisions := []Decision{d}
 	decisions = append(decisions, s.runScheduleLocked(now)...)
-	if err := s.persistLocked(); err != nil {
-		return nil, err
-	}
-	return &decisions[0], nil
+	return decisions, nil
 }
 
 // Cancel 取消作业：排队中则直接离开队列；运行中则释放资源。终态不可取消。
 func (s *Scheduler) Cancel(jobID string) (*Decision, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	decisions, err := s.cancelLocked(jobID)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.persistLocked(); err != nil {
+		return nil, err
+	}
+	return &decisions[0], nil
+}
+
+// cancelLocked 是 Cancel 的持锁实现，返回本步全部裁决（含后续调度级联）。
+func (s *Scheduler) cancelLocked(jobID string) ([]Decision, error) {
 	job, ok := s.jobs[jobID]
 	if !ok {
 		return nil, ErrJobNotFound
@@ -285,10 +313,7 @@ func (s *Scheduler) Cancel(jobID string) (*Decision, error) {
 	}
 	decisions := []Decision{d}
 	decisions = append(decisions, s.runScheduleLocked(now)...)
-	if err := s.persistLocked(); err != nil {
-		return nil, err
-	}
-	return &decisions[0], nil
+	return decisions, nil
 }
 
 // Get 查询作业当前状态副本。
@@ -606,6 +631,16 @@ func (s *Scheduler) persistLocked() error {
 		QueuedOrder: append([]string{}, s.queuedIDs...),
 	}
 	return s.store.Save(st)
+}
+
+// exportStateLocked 导出当前完整状态的深拷贝（供推演器做检查点与回滚）。
+func (s *Scheduler) exportStateLocked() *persistedState {
+	return clonePersistedState(&persistedState{
+		NextSeq:     s.nextSeq,
+		Tenants:     s.tenants,
+		Jobs:        s.jobs,
+		QueuedOrder: append([]string{}, s.queuedIDs...),
+	})
 }
 
 func cloneJob(j *Job) *Job {

@@ -91,6 +91,47 @@ func (s *fileStore) Load() (*persistedState, error) {
 
 func (s *fileStore) Close() error { return nil }
 
+// memStore 是进程内存储，用于推演器内部调度器（不触碰任何真实文件）。
+type memStore struct {
+	st *persistedState
+}
+
+func (m *memStore) Save(st *persistedState) error {
+	m.st = clonePersistedState(st)
+	return nil
+}
+
+func (m *memStore) Load() (*persistedState, error) {
+	if m.st == nil {
+		return nil, nil
+	}
+	return clonePersistedState(m.st), nil
+}
+
+func (m *memStore) Close() error { return nil }
+
+// clonePersistedState 深拷贝持久化状态（作业为指针类型，必须逐条复制，
+// 保证推演副本与源状态完全隔离）。
+func clonePersistedState(st *persistedState) *persistedState {
+	if st == nil {
+		return nil
+	}
+	c := &persistedState{
+		NextSeq:     st.NextSeq,
+		Tenants:     make(map[string]Tenant, len(st.Tenants)),
+		Jobs:        make(map[string]*Job, len(st.Jobs)),
+		QueuedOrder: append([]string{}, st.QueuedOrder...),
+	}
+	for id, t := range st.Tenants {
+		c.Tenants[id] = t
+	}
+	for id, j := range st.Jobs {
+		jc := *j
+		c.Jobs[id] = &jc
+	}
+	return c
+}
+
 // nopStore 不做任何持久化。
 type nopStore struct{}
 
