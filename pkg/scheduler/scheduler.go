@@ -54,15 +54,10 @@ func New(cfg Config, tenants []Tenant) (*Scheduler, error) {
 	if clock == nil {
 		clock = systemClock{}
 	}
-	if cfg.AgeIncrement < 0 || cfg.AgingPeriod < 0 {
+	if configInvalid(cfg) {
 		return nil, ErrInvalidArgument
 	}
-	if cfg.AgingPeriod == 0 {
-		cfg.AgingPeriod = defaultAgingPeriod
-	}
-	if cfg.AgeIncrement == 0 {
-		cfg.AgeIncrement = defaultAgeIncrement
-	}
+	cfg = normalizeConfig(cfg)
 	s := &Scheduler{
 		cfg:     cfg,
 		clock:   clock,
@@ -82,6 +77,28 @@ func New(cfg Config, tenants []Tenant) (*Scheduler, error) {
 		return nil, err
 	}
 	return s, nil
+}
+
+// normalizeConfig 校验并归一化老化参数（负值非法，零值取默认），
+// 供真实调度器与推演器复用，保证两边调度参数完全一致。
+func normalizeConfig(cfg Config) Config {
+	if cfg.AgeIncrement < 0 || cfg.AgingPeriod < 0 {
+		// 保持与 New 原有行为一致：调用方通过 New 得到 ErrInvalidArgument。
+		// 推演器在构造时单独检查负值并返回错误。
+		return cfg
+	}
+	if cfg.AgingPeriod == 0 {
+		cfg.AgingPeriod = defaultAgingPeriod
+	}
+	if cfg.AgeIncrement == 0 {
+		cfg.AgeIncrement = defaultAgeIncrement
+	}
+	return cfg
+}
+
+// configInvalid 报告配置是否非法（供真实/推演构造共用）。
+func configInvalid(cfg Config) bool {
+	return cfg.AgeIncrement < 0 || cfg.AgingPeriod < 0
 }
 
 func (s *Scheduler) validateTenant(t Tenant) error {
@@ -126,6 +143,60 @@ func (s *Scheduler) restore() error {
 		s.pool.allocate(j.TenantID, j.Request)
 	}
 	return nil
+}
+
+// exportStateLocked 返回调度器完整可变状态的深拷贝，
+// 供推演器从真实调度器的当前状态点 fork 出一份完全独立的副本。
+// 调用方必须持有 s.mu。
+func (s *Scheduler) exportStateLocked() *persistedState {
+	tenants := make(map[string]Tenant, len(s.tenants))
+	for k, v := range s.tenants {
+		tenants[k] = v
+	}
+	jobs := make(map[string]*Job, len(s.jobs))
+	for k, v := range s.jobs {
+		jobs[k] = cloneJob(v)
+	}
+	return &persistedState{
+		NextSeq:     s.nextSeq,
+		Tenants:     tenants,
+		Jobs:        jobs,
+		QueuedOrder: append([]string{}, s.queuedIDs...),
+	}
+}
+
+// newIsolatedScheduler 用给定（已深拷贝的）状态构造一个纯内存、零外部 IO 的
+// 调度器副本：StorePath/Clock 均被覆盖，绝不触碰任何真实文件。
+// 推演器的每一步都在隔离副本上进行，演算成功并原子存档后才替换旧副本，
+// 因此存档失败天然不会污染已生效的状态。
+func newIsolatedScheduler(cfg Config, clock Clock, st *persistedState) (*Scheduler, error) {
+	cfg.StorePath = ""
+	cfg.Clock = clock
+	s := &Scheduler{
+		cfg:     cfg,
+		clock:   clock,
+		store:   nopStore{},
+		pool:    newPool(cfg.Capacity),
+		nextSeq: 1,
+		tenants: make(map[string]Tenant),
+		jobs:    make(map[string]*Job),
+	}
+	if st != nil {
+		s.nextSeq = st.NextSeq
+		if st.Tenants != nil {
+			s.tenants = st.Tenants
+		}
+		s.jobs = st.Jobs
+		s.queuedIDs = st.QueuedOrder
+		if s.queuedIDs == nil {
+			s.queuedIDs = []string{}
+		}
+		for _, id := range s.runningIDsLocked() {
+			j := s.jobs[id]
+			s.pool.allocate(j.TenantID, j.Request)
+		}
+	}
+	return s, nil
 }
 
 // RegisterTenant 注册或更新一个租户配额（更新配额不影响已运行作业）。

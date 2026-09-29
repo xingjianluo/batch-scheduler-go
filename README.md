@@ -198,7 +198,28 @@ go test ./... -race -run 'TestSubmitRejectReasons|TestQuotaBoundary|TestClusterC
 go test ./... -race -run 'TestConcurrent'    # 并发提交、无超卖、重复占位
 go test ./... -race -run 'TestPriority|TestEqual|TestFIFO|TestAging|TestMinimalVictim|TestPreempted' # 抢占/回退/防饿死/确定性
 go test ./... -race -run 'TestCrash|TestRecovery' # 崩溃恢复
+go test ./... -race -run 'TestRehearsal'          # 推演：逐项对齐/中断续跑/存档失败/逻辑时间/兼容
 ```
+
+> 说明：`TestRehearsalResumeNoDrift` 与 `TestRehearsalSaveFailureAtomic`
+> 都是表驱动子测试，分别枚举全部中断点（0..N）与在每一步注入存档失败，
+> 可用 `-run 'TestRehearsalResumeNoDrift/cutoff-7'` 之类的方式只跑单个断点。
+
+### 推演测试场景清单
+
+| 测试 | 覆盖点 |
+| --- | --- |
+| `TestRehearsalParityFromLive` | 从运行中的真实调度器 fork；20 步混合事件的错误/裁决/快照与真跑逐项一致；双向状态隔离 |
+| `TestRehearsalParityFromStateFile` | 从已保存状态点推演与真跑逐项对齐；源状态文件字节级只读 |
+| `TestRehearsalResumeNoDrift` | 在每个中断点（含 0 步）重启续跑，最终状态与全部历史报告不漂移 |
+| `TestRehearsalSaveFailureAtomic` | 每一步注入存档失败：对外/重启均无痕迹；原样重试幂等且结论一致 |
+| `TestRehearsalSaveFailureRepeated` | 同一步连续失败多次后重试只生效一次 |
+| `TestRehearsalLogicalTimeDeterminism` | 瞬间跑完 vs 带真实停顿分批跑完结论一致；无 Advance 时真实等待不引发老化抢占 |
+| `TestRehearsalTimeCannotGoBack` | 逻辑时间不可回退，拒绝不消耗步骤、重启后仍拒绝 |
+| `TestRehearsalConcurrentApply` | 并发推演提交串行生效、无超卖/无重复、存档完整 |
+| `TestRehearsalCheckpointGuards` | 已存在存档拒绝覆盖；普通状态文件不可当作推演存档打开 |
+| `TestRehearsalCompatibilityWithSchedulerStore` | 旧状态文件可作种子；推演存档可被旧调度器加载器读出，格式向后兼容 |
+| `TestRehearsalRejectedStepsSurviveRestart` | 含业务错误（五类拒绝/状态错误）的步骤随存档保存，重启后逐项一致 |
 
 ### 测试场景清单
 
@@ -223,7 +244,125 @@ go test ./... -race -run 'TestCrash|TestRecovery' # 崩溃恢复
 
 ---
 
-## 7. 包结构
+## 7. 推演（Rehearsal）：先推演，再决定
+
+在容量规划与故障复盘时，光看“现在是什么状态”不够，还需要回答**“如果按某个
+顺序发生这些事，最后会怎样、每一步为什么这样判”**。推演能力让你从**当前正在
+跑的状态**或**一个已保存的状态点**出发，喂一串事件先跑一遍：
+
+- 完全在**独立副本**上演算，**绝不触碰、也不影响**原来那台真实调度器；
+- 复用同一套调度代码（准入、老化、抢占、固定点），推演结论与真按相同顺序
+  操作一遍的结果**逐项一致**——不会“推演一套、真跑另一套”；
+- 等待/老化等一切与时间有关的判断都按调用方推进的**逻辑时间**计算，
+  **不读墙钟**：同一段事件瞬间跑完与隔几秒分几次跑，结论完全相同；
+- 推演进度本身**原子持久化**，进程被干掉后可从最近一步**续跑**，最终结论
+  与一口气跑完完全一致；每一步**要么彻底生效，要么对外等同于没发生**。
+
+### 7.1 事件类型
+
+| 构造函数 | 含义 |
+| --- | --- |
+| `NewSubmitEvent(jobID, tenantID, priority, req)` | 新作业提交（含五类拒绝路径） |
+| `NewCompleteEvent(jobID)` | 作业结束，释放资源并触发调度 |
+| `NewCancelEvent(jobID)` | 取消排队/运行中的作业 |
+| `NewAdvanceEvent(at)` | 把逻辑时间推进到 `at`（不可向过去推进） |
+
+> 只有 `Advance` 会改变逻辑时间；`Submit/Complete/Cancel` 使用当前逻辑时间，
+> 不会因为真实世界过了多久而改变结论。需要“等一会儿再提交”时，请显式先
+> `Advance` 再 `Submit`——这与真实调度器配合同步的逻辑时钟完全对应。
+
+### 7.2 基本用法
+
+```go
+import "github.com/xingjianluo/batch-scheduler-go/pkg/scheduler"
+
+// 方式一：从正在运行的真实调度器“分叉”出一轮推演（只读取一次快照副本）
+rh, err := scheduler.NewRehearsalFromLive(liveScheduler, "./data/plan-a.json")
+
+// 方式二：从一个已保存的状态点出发（源状态文件全程只读，绝不被改写）
+rh, err := scheduler.NewRehearsalFromStateFile(
+    "./data/state.json",            // 只读的种子状态
+    "./data/plan-a.json",           // 推演自己的进度存档
+    cfg,                            // 必须与产生种子状态时一致（容量/老化参数）
+    seedTime,                       // 推演起始逻辑时间
+)
+
+events := []scheduler.RehearsalEvent{
+    scheduler.NewAdvanceEvent(seedTime.Add(30 * time.Second)),
+    scheduler.NewSubmitEvent("forecast-1", "team-a", 9, scheduler.Resource{CPU: 4}),
+    scheduler.NewCompleteEvent("job-1"),
+    scheduler.NewCancelEvent("job-2"),
+}
+reports, err := rh.ApplyAll(events)
+// reports[i].Err        本步业务结果：nil 成功；*RejectError 被拒；
+//                       ErrJobNotFound/ErrJobNotRunning/ErrJobAlreadyTerminal 等
+// reports[i].Decisions  本步全部裁决（admit/start/preempt/complete/cancel），
+//                       含每一步的资源用量快照、抢占牺牲品与判定原因
+// reports[i].Snapshot   本步之后的完整快照
+_ = reports
+final := rh.Snapshot()   // 最终哪些在运行、哪些排队、哪些被拒
+rh.Close()
+```
+
+- `Apply(ev)` 一次只应用一个事件（便于在任意点暂停观察）；`ApplyAll` 是其顺序封装。
+- **业务结果**（提交被拒绝、作业不存在、状态不符）属于事件的正常演算结果，
+  记录在 `StepReport.Err` 里并继续后续事件；`Apply` 只为这类结果返回 `nil`。
+  只有**基础设施错误**（存档 IO 失败）才以非 nil error 返回。
+
+### 7.3 逻辑时间与真实时间的关系
+
+- 推演内部是一台只接受 `Advance` 驱动的手动时钟（`manualClock`），
+  **任何地方都不读取 `time.Now()`**；老化公式
+  `Priority + floor(now-QueuedAt)/AgingPeriod*AgeIncrement` 中的 `now`
+  永远是当前逻辑时间。
+- 因此：同一段事件，无论调用方是在一个 for 循环里瞬间喂完，还是每步之间
+  `time.Sleep` 几秒、甚至跨天分批喂，只要事件与其 `Advance` 时刻相同，
+  推演结论（运行/排队/拒绝及原因、抢占、每步裁决）**逐项相同**。
+- 逻辑时间**单调不回退**：`Advance` 到早于当前的时刻会得到
+  `ErrRehearsalTimeGoesBack`，该调用既不演算也不存档，状态原地不动。
+- 要让“推演与真跑逐项一致”，真实那侧也应使用由调用方同步推进的逻辑时钟
+  （如测试中的假时钟；生产中即你的仿真/事件时间），在每个 `Advance(t)`
+  处把真跑时钟也设到 `t`，其余一一对应执行 `Submit/Complete/Cancel`。
+
+### 7.4 中断续跑语义
+
+- 构造时与**每一步成功生效时**都原子写入进度存档（临时文件 + fsync + rename），
+  因此崩溃后磁盘上只可能是“上一步”或“本步”，绝不会是写了一半的存档。
+- 进程重启后调用 `OpenRehearsal(path)`：恢复作业表、队列顺序、资源账目、
+  提交序号、容量/老化参数与逻辑时间，并重建历史步骤报告；随后继续 `Apply`
+  剩余事件即可。`Applied()` 给出已生效步数，便于跳过已完成的事件前缀
+  （也可以把完整事件列表原样再喂一遍——已存档的前缀在磁盘上不会重复应用）。
+- 在**每一个**中断点（含“刚创建、一步未跑”）续跑，最终状态与历史报告都与
+  一口气跑完逐项一致（`TestRehearsalResumeNoDrift` 枚举了全部中断点）。
+
+### 7.5 存档失败时的对外一致性
+
+每一步采用“**在候选副本上演算 → 原子存档 → 成功后才转正**”的顺序：
+
+- 演算成功但存档失败：候选副本被丢弃，推演保留旧状态，
+  调用方看到失败；重启后磁盘上也看不到这一步；
+- 随后原样重试同一事件：只生效一次，**不会多占资源、不会让队列或状态错位**；
+- 同一步连续失败任意次后再成功，最终结论仍与无失败时逐项一致
+  （`TestRehearsalSaveFailureAtomic` 在每一步上注入失败验证）。
+
+### 7.6 与已有持久化数据的兼容
+
+推演存档（`rehearsalVersion/rehearsalKind` 信封 + 状态字段）与调度器原有
+状态文件**同构、互相兼容**：
+
+- 调度器写出的 `state.json` 可**直接作为推演种子**（`NewRehearsalFromStateFile`
+  只读打开，字节级不改动它）；
+- 推演存档中的 `NextSeq/Tenants/Jobs/QueuedOrder` 使用与普通状态文件**完全
+  相同的 JSON 键**，旧版 `Scheduler` 加载器会忽略新增的信封/进度字段，
+  因而同一份推演存档也能被普通调度器当作状态点读出并继续运行；
+- 新建推演时若目标路径已有文件（推演存档或普通状态文件）会得到
+  `ErrRehearsalCheckpointExists`，防止覆盖另一轮推演；续跑请用
+  `OpenRehearsal`；用 `OpenRehearsal` 打开普通状态文件会得到
+  `ErrRehearsalNotACheckpoint`。
+
+---
+
+## 8. 包结构
 
 ```
 pkg/scheduler/
@@ -233,5 +372,7 @@ pkg/scheduler/
   pool.go        # 进程内资源池（集群用量 + 各租户用量记账）
   store.go       # 持久化接口 + JSON 原子写文件存储
   scheduler.go   # 准入、老化排序、抢占、调度固定点与崩溃恢复
+  rehearsal.go   # 推演器：隔离副本、逻辑时钟、事件演算、逐步原子提交、续跑
+  rehearsal_store.go # 推演进度存档的原子读写与格式信封
   *_test.go      # 上述全部场景测试
 ```
