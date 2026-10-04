@@ -112,18 +112,11 @@ func runReal(t *testing.T, s *Scheduler, clk *fakeClock, t0 time.Time, ops []rep
 			}
 			out = append(out, stepOutcome{i, err, ds, started})
 		case RehearsalComplete:
-			d, err := s.Complete(o.id)
-			var ds []Decision
-			if d != nil {
-				ds = []Decision{*d}
-			}
+			// 与推演器同样取“完成 + 全部连锁裁决”。
+			ds, err := s.complete(o.id)
 			out = append(out, stepOutcome{i, err, ds, false})
 		case RehearsalCancel:
-			d, err := s.Cancel(o.id)
-			var ds []Decision
-			if d != nil {
-				ds = []Decision{*d}
-			}
+			ds, err := s.cancel(o.id)
 			out = append(out, stepOutcome{i, err, ds, false})
 		case RehearsalAdvance:
 			clk.t = o.at

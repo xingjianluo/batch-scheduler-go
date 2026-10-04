@@ -37,17 +37,23 @@ type rehearsalCheckpoint struct {
 }
 
 // stepRecord 是一步推演结果的可持久化表示。
-// 业务错误（提交拒绝、作业不存在等）属于“事件演算结果”的一部分，随存档
-// 一起保存，使重启续跑后重建的报告与不中断时逐项一致。
+// 业务错误（提交拒绝、作业不存在等）与本步生效后的完整状态快照都属于
+// “事件演算结果”的一部分，随存档一起保存，使重启续跑后重建的报告
+// （含每一步当时的状态、提交的受理或拒绝结果、失败原因）与不中断时逐项一致。
 type stepRecord struct {
 	Event RehearsalEvent `json:"Event"`
 	Time  time.Time      `json:"Time"`
 
 	Decisions []Decision `json:"Decisions"`
 
-	// Submit 事件的受理结果；其他事件留空。
+	// Submit 事件且被受理时的结果；未被受理（拒绝）时全部留空，
+	// 重启后据此还原“受理/拒绝”的原始结论。
 	SubmitJobID string `json:"SubmitJobID,omitempty"`
 	Started     bool   `json:"Started,omitempty"`
+	SubmitJob   *Job   `json:"SubmitJob,omitempty"`
+
+	// 本步生效后的状态快照（当时的状态），重启后历史步骤依然可见。
+	Snapshot *Snapshot `json:"Snapshot,omitempty"`
 
 	// 错误序列化：拒绝类错误按 Kind 还原；哨兵错误按名称还原；其余保留文本。
 	HasError    bool       `json:"HasError,omitempty"`

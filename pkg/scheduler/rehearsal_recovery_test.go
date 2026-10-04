@@ -92,6 +92,8 @@ func TestRehearsalResumeNoDrift(t *testing.T) {
 				}
 			}
 			assertInvariants(t, cont.Snapshot(), tm, "resume")
+			t.Logf("cutoff=%d: 中断续跑 %d 步历史报告（含每步状态快照/受理结果/失败原因）与最终状态均逐项一致",
+				cutoff, len(gotReps))
 			_ = cont.Close()
 		})
 	}
@@ -108,8 +110,9 @@ func logicalTimeAfter(t0 time.Time, evs []RehearsalEvent) time.Time {
 	return now
 }
 
-// reportsEqualForHistory 比较重启后重建的历史报告（重启后 Snapshot 字段为 nil，
-// Submit 指针仅保留 Started）与不中断时的报告。
+// reportsEqualForHistory 严格逐项比较两份步骤报告：
+// 事件、逻辑时间、完整裁决列表、提交受理结果（含受理/拒绝的 nil 性、
+// Started、受理裁决、作业副本）、当时状态快照与错误，全部一致才算相等。
 func reportsEqualForHistory(a, b RehearsalStepReport) bool {
 	if a.Index != b.Index {
 		return false
@@ -123,12 +126,61 @@ func reportsEqualForHistory(a, b RehearsalStepReport) bool {
 	if !decisionsEqual(a.Decisions, b.Decisions) {
 		return false
 	}
-	aStarted := a.Submit != nil && a.Submit.Started
-	bStarted := b.Submit != nil && b.Submit.Started
-	if aStarted != bStarted {
+	if !submitResultsEqual(a.Submit, b.Submit) {
+		return false
+	}
+	if !snapshotsDeepEqual(a.Snapshot, b.Snapshot) {
 		return false
 	}
 	return errorsEqual(a.Err, b.Err)
+}
+
+// submitResultsEqual 比较提交受理结果：nil 性（受理 vs 拒绝）、Started、
+// 受理裁决、完整裁决列表与作业副本逐项一致。
+func submitResultsEqual(a, b *SubmitResult) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	if a.Started != b.Started {
+		return false
+	}
+	if (a.Job == nil) != (b.Job == nil) {
+		return false
+	}
+	if a.Job != nil && *a.Job != *b.Job {
+		return false
+	}
+	if !decisionsEqual([]Decision{a.Decision}, []Decision{b.Decision}) {
+		return false
+	}
+	return decisionsEqual(a.Decisions, b.Decisions)
+}
+
+// snapshotsDeepEqual 深比较两份状态快照（含快照时间与租户列表）。
+func snapshotsDeepEqual(a, b *Snapshot) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	if !a.Time.Equal(b.Time) || a.Capacity != b.Capacity || a.Used != b.Used {
+		return false
+	}
+	if !equalStrings(a.QueuedIDs, b.QueuedIDs) || !equalStrings(a.RunningIDs, b.RunningIDs) {
+		return false
+	}
+	if len(a.Jobs) != len(b.Jobs) || len(a.Tenants) != len(b.Tenants) {
+		return false
+	}
+	for i := range a.Jobs {
+		if a.Jobs[i] != b.Jobs[i] {
+			return false
+		}
+	}
+	for i := range a.Tenants {
+		if a.Tenants[i] != b.Tenants[i] {
+			return false
+		}
+	}
+	return reflect.DeepEqual(a.TenantUsed, b.TenantUsed)
 }
 
 func dumpStep(r RehearsalStepReport) string {
