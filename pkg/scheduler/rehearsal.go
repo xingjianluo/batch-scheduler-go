@@ -29,7 +29,9 @@ var (
 )
 
 // rehearsalStateVersion 是推演存档的格式版本。
-const rehearsalStateVersion = 1
+// v2：每步记录完整状态快照与提交受理详情（受理标志/作业副本），
+// 保证崩溃续跑后重建的历史步骤报告与不中断连续跑完逐项一致。
+const rehearsalStateVersion = 2
 
 // RehearsalKind 标识事件类型。
 type RehearsalKind int
@@ -258,17 +260,11 @@ func (r *Rehearsal) Apply(ev RehearsalEvent) (*RehearsalStepReport, error) {
 		}
 		rep.Err = serr
 	case RehearsalComplete:
-		d, derr := cand.Complete(ev.JobID)
-		if d != nil {
-			rep.Decisions = []Decision{*d}
-		}
-		rep.Err = derr
+		// CompleteAll 返回“完成”本身及其连锁触发的全部调度裁决
+		// （启动/抢占/重新入队），逐步记录、与真跑逐项对齐。
+		rep.Decisions, rep.Err = cand.CompleteAll(ev.JobID)
 	case RehearsalCancel:
-		d, derr := cand.Cancel(ev.JobID)
-		if d != nil {
-			rep.Decisions = []Decision{*d}
-		}
-		rep.Err = derr
+		rep.Decisions, rep.Err = cand.CancelAll(ev.JobID)
 	case RehearsalAdvance:
 		candClock.t = ev.At
 		ds, terr := cand.Tick(ev.At)
@@ -283,7 +279,10 @@ func (r *Rehearsal) Apply(ev RehearsalEvent) (*RehearsalStepReport, error) {
 		return nil, ErrInvalidArgument
 	}
 
-	// 2) 演算完成（含业务拒绝/错误），原子持久化本步。
+	// 2) 演算完成（含业务拒绝/错误）：先取本步生效后的状态快照
+	//    （随报告与存档一起保存，重启后历史步骤仍能看到当时的状态），
+	//    再原子持久化本步。
+	rep.Snapshot = cand.Snapshot()
 	if r.path != "" {
 		checkpoint := r.buildCheckpointLocked(cand, rep)
 		if err := r.saveFunc(checkpoint); err != nil {
@@ -294,7 +293,6 @@ func (r *Rehearsal) Apply(ev RehearsalEvent) (*RehearsalStepReport, error) {
 
 	// 3) 存档成功（或纯内存）：候选副本转正。
 	r.sched = cand
-	rep.Snapshot = cand.Snapshot()
 	r.steps = append(r.steps, *rep)
 	return rep, nil
 }
@@ -419,17 +417,23 @@ func (cp *rehearsalCheckpoint) toPersistedState() *persistedState {
 }
 
 // stepRecordFromReport 把步骤报告序列化为存档记录（错误分类保存）。
+// 完整保存该步引发的全部裁决、提交受理详情与生效后的状态快照，
+// 使重启后重建的历史报告与内存中的原始报告逐项一致。
 func stepRecordFromReport(rep *RehearsalStepReport) stepRecord {
 	rec := stepRecord{
 		Event:     rep.Event,
 		Time:      rep.Time,
 		Decisions: append([]Decision{}, rep.Decisions...),
+		Snapshot:  rep.Snapshot,
 	}
-	// 提交作业 ID 直接取自事件（重启重建的历史报告不含完整 Job 指针）。
 	if rep.Event.Kind == RehearsalSubmit {
 		rec.SubmitJobID = rep.Event.JobID
+		// 仅受理的提交才有 SubmitResult；被拒提交 Submit 为 nil，
+		// 必须显式区分，否则重启后“受理/拒绝”会对不上。
 		if rep.Submit != nil {
+			rec.SubmitAccepted = true
 			rec.Started = rep.Submit.Started
+			rec.SubmitJob = rep.Submit.Job
 		}
 	}
 	if rep.Err != nil {
@@ -459,19 +463,28 @@ func stepRecordFromReport(rep *RehearsalStepReport) stepRecord {
 }
 
 // toReport 把存档记录重建为步骤报告（错误按类别还原为等值错误）。
-// 历史步骤的 Submit 指针不再重建（作业当前状态可通过 Snapshot 查询），
-// 仅保留 Started 标志与完整裁决列表，足以逐项对齐。
+// 受理的提交完整还原 SubmitResult（作业副本、Started、裁决列表）；
+// 被拒的提交保持 Submit 为 nil，与不中断时的原始报告逐项一致。
 func (rec stepRecord) toReport(index int) RehearsalStepReport {
 	rep := RehearsalStepReport{
 		Index:     index,
 		Event:     rec.Event,
 		Time:      rec.Time,
 		Decisions: append([]Decision{}, rec.Decisions...),
+		Snapshot:  rec.Snapshot,
 	}
-	if rec.SubmitJobID != "" {
-		// 历史步骤不重建完整作业指针（作业当前状态可通过 Snapshot 查询），
-		// 仅保留 Started 与完整裁决列表，足以逐项对齐。
-		rep.Submit = &SubmitResult{Started: rec.Started}
+	if rec.SubmitAccepted {
+		sub := &SubmitResult{
+			Started:   rec.Started,
+			Decisions: append([]Decision{}, rec.Decisions...),
+		}
+		if rec.SubmitJob != nil {
+			sub.Job = cloneJob(rec.SubmitJob)
+		}
+		if len(rec.Decisions) > 0 {
+			sub.Decision = rec.Decisions[0]
+		}
+		rep.Submit = sub
 	}
 	if rec.HasError {
 		switch rec.ErrSentinel {

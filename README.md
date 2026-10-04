@@ -34,6 +34,11 @@ s.Close()
 
 每次 `Submit / Complete / Cancel` 都会自动触发调度，并在状态变更后**原子持久化**。
 
+> 说明：`Complete`/`Cancel` 只返回“完成/取消”动作本身的裁决；若需要该操作
+> 引发的**全部连锁裁决**（释放资源后排队作业的启动、抢占、重新入队），
+> 请使用 `CompleteAll(jobID)` / `CancelAll(jobID)`，返回完整 `[]Decision`
+> （第一个元素即动作本身）。推演（见第 7 节）每一步记录的正是这份完整列表。
+
 ---
 
 ## 2. 调度模型
@@ -199,6 +204,7 @@ go test ./... -race -run 'TestConcurrent'    # 并发提交、无超卖、重复
 go test ./... -race -run 'TestPriority|TestEqual|TestFIFO|TestAging|TestMinimalVictim|TestPreempted' # 抢占/回退/防饿死/确定性
 go test ./... -race -run 'TestCrash|TestRecovery' # 崩溃恢复
 go test ./... -race -run 'TestRehearsal'          # 推演：逐项对齐/中断续跑/存档失败/逻辑时间/兼容
+go test ./... -race -run 'TestRehearsalCascade|TestRehearsalCompletePreemption' -v  # 推演：级联记录/续跑一致/失败重试（日志可见各场景）
 ```
 
 > 说明：`TestRehearsalResumeNoDrift` 与 `TestRehearsalSaveFailureAtomic`
@@ -212,6 +218,10 @@ go test ./... -race -run 'TestRehearsal'          # 推演：逐项对齐/中断
 | `TestRehearsalParityFromLive` | 从运行中的真实调度器 fork；20 步混合事件的错误/裁决/快照与真跑逐项一致；双向状态隔离 |
 | `TestRehearsalParityFromStateFile` | 从已保存状态点推演与真跑逐项对齐；源状态文件字节级只读 |
 | `TestRehearsalResumeNoDrift` | 在每个中断点（含 0 步）重启续跑，最终状态与全部历史报告不漂移 |
+| `TestRehearsalCascadeDecisionsRecorded` | 完成/取消引发的级联启动、抢占被逐步完整记录，且与真跑每步结论（裁决+快照）逐项一致 |
+| `TestRehearsalCompletePreemptionCascadeDetail` | “完成只释放部分资源→排队高优作业抢占低优作业顶上”逐步核对：谁被抢、谁顶上、按原序号回队、资源账目 |
+| `TestRehearsalCascadeResumeIdentical` | 级联密集事件序列在全部中断点杀掉续跑，每步历史（当时快照/受理或拒绝/失败原因/全部裁决）与基准逐项一致 |
+| `TestRehearsalCascadeSaveFailureRetryOnce` | 级联步骤存档失败：连锁对外与重启后均不可见；原样重试只生效一次（被抢次数恰好 1、资源不多占）；续跑后语义不变 |
 | `TestRehearsalSaveFailureAtomic` | 每一步注入存档失败：对外/重启均无痕迹；原样重试幂等且结论一致 |
 | `TestRehearsalSaveFailureRepeated` | 同一步连续失败多次后重试只生效一次 |
 | `TestRehearsalLogicalTimeDeterminism` | 瞬间跑完 vs 带真实停顿分批跑完结论一致；无 Advance 时真实等待不引发老化抢占 |
@@ -296,15 +306,24 @@ events := []scheduler.RehearsalEvent{
 reports, err := rh.ApplyAll(events)
 // reports[i].Err        本步业务结果：nil 成功；*RejectError 被拒；
 //                       ErrJobNotFound/ErrJobNotRunning/ErrJobAlreadyTerminal 等
-// reports[i].Decisions  本步全部裁决（admit/start/preempt/complete/cancel），
-//                       含每一步的资源用量快照、抢占牺牲品与判定原因
-// reports[i].Snapshot   本步之后的完整快照
+// reports[i].Decisions  本步引发的全部调度裁决（admit/start/preempt/complete/
+//                       cancel）：完成或取消一个作业时，由它连锁触发的启动、
+//                       抢占（含牺牲品 ID）、重新入队都完整记录在内，
+//                       每条裁决带资源用量快照与判定原因
+// reports[i].Submit     提交事件的受理结果（被拒时为 nil，错误在 Err 中）
+// reports[i].Snapshot   本步生效后的完整状态快照
 _ = reports
 final := rh.Snapshot()   // 最终哪些在运行、哪些排队、哪些被拒
 rh.Close()
 ```
 
 - `Apply(ev)` 一次只应用一个事件（便于在任意点暂停观察）；`ApplyAll` 是其顺序封装。
+- **每一步记录的内容**：事件本身、执行时的逻辑时间、该步引发的**全部**调度
+  裁决（对 `Complete`/`Cancel` 事件，`Decisions[0]` 是结束/取消动作本身，
+  其后依次是释放资源连锁触发的启动/抢占裁决，可清楚看出有没有发生抢占、
+  谁被抢了、谁顶上来）、提交受理结果、业务错误，以及该步生效后的状态快照。
+  这些内容与同样顺序在真实调度器上跑一遍（`Submit`/`CompleteAll`/
+  `CancelAll`/`Tick`）得到的结论**逐项一致**。
 - **业务结果**（提交被拒绝、作业不存在、状态不符）属于事件的正常演算结果，
   记录在 `StepReport.Err` 里并继续后续事件；`Apply` 只为这类结果返回 `nil`。
   只有**基础设施错误**（存档 IO 失败）才以非 nil error 返回。
@@ -332,18 +351,29 @@ rh.Close()
   提交序号、容量/老化参数与逻辑时间，并重建历史步骤报告；随后继续 `Apply`
   剩余事件即可。`Applied()` 给出已生效步数，便于跳过已完成的事件前缀
   （也可以把完整事件列表原样再喂一遍——已存档的前缀在磁盘上不会重复应用）。
-- 在**每一个**中断点（含“刚创建、一步未跑”）续跑，最终状态与历史报告都与
-  一口气跑完逐项一致（`TestRehearsalResumeNoDrift` 枚举了全部中断点）。
+- **历史报告逐项一致**：每一步的完整记录都随存档持久化——包括该步当时的
+  状态快照、全部连锁调度裁决、提交是被受理还是被拒绝（受理方含作业副本与
+  Started 标志）、失败原因（拒绝类别/哨兵错误按类型还原）。因此在**每一个**
+  中断点（含“刚创建、一步未跑”）杀掉续跑，恢复出的每一步历史报告与最终
+  状态都与不中断连续跑完**逐项一致**，而不仅仅是最终作业状态一致
+  （`TestRehearsalResumeNoDrift` 与 `TestRehearsalCascadeResumeIdentical`
+  分别枚举了通用场景与级联密集场景的全部中断点）。
+- 存档格式版本为 `rehearsalVersion=2`（v2 起每步记录完整快照与受理详情）；
+  旧版本存档会得到 `ErrRehearsalUnsupportedVersion`，请重新发起推演。
 
 ### 7.5 存档失败时的对外一致性
 
 每一步采用“**在候选副本上演算 → 原子存档 → 成功后才转正**”的顺序：
 
 - 演算成功但存档失败：候选副本被丢弃，推演保留旧状态，
-  调用方看到失败；重启后磁盘上也看不到这一步；
-- 随后原样重试同一事件：只生效一次，**不会多占资源、不会让队列或状态错位**；
-- 同一步连续失败任意次后再成功，最终结论仍与无失败时逐项一致
-  （`TestRehearsalSaveFailureAtomic` 在每一步上注入失败验证）。
+  调用方看到失败；重启后磁盘上也看不到这一步——**该步本身以及它引发的
+  全部连锁动作（启动/抢占/重新入队）都对外不可见，重启后也不会冒出来**；
+- 随后原样重试同一事件：只生效一次，**不会多占资源、不会让队列或资源
+  账目错位**（例如被抢占次数恰好增加一次）；
+- 同一步连续失败任意次后再成功，最终结论仍与无失败时逐项一致；
+  杀掉重开后续跑，同样的失败/重试语义保持不变
+  （`TestRehearsalSaveFailureAtomic` 在每一步上注入失败验证，
+  `TestRehearsalCascadeSaveFailureRetryOnce` 专门验证级联步骤的失败与重试）。
 
 ### 7.6 与已有持久化数据的兼容
 

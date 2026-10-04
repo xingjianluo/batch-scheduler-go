@@ -112,18 +112,10 @@ func runReal(t *testing.T, s *Scheduler, clk *fakeClock, t0 time.Time, ops []rep
 			}
 			out = append(out, stepOutcome{i, err, ds, started})
 		case RehearsalComplete:
-			d, err := s.Complete(o.id)
-			var ds []Decision
-			if d != nil {
-				ds = []Decision{*d}
-			}
+			ds, err := s.CompleteAll(o.id)
 			out = append(out, stepOutcome{i, err, ds, false})
 		case RehearsalCancel:
-			d, err := s.Cancel(o.id)
-			var ds []Decision
-			if d != nil {
-				ds = []Decision{*d}
-			}
+			ds, err := s.CancelAll(o.id)
 			out = append(out, stepOutcome{i, err, ds, false})
 		case RehearsalAdvance:
 			clk.t = o.at
@@ -208,6 +200,35 @@ func assertOutcomesEqual(t *testing.T, real []stepOutcome, reps []RehearsalStepR
 			t.Fatalf("step %d started mismatch: real=%v rehe=%v", i, ro.started, rhStarted)
 		}
 	}
+}
+
+// snapshotsStrictEqual 严格比较两个快照的全部字段（用于“续跑历史步骤
+// vs 不中断基准”的逐项一致性断言）；任一字段不同都返回 false。
+// 注意区别于 preemption_test.go 中只比较关键字段的 snapshotsEqual。
+func snapshotsStrictEqual(a, b *Snapshot) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	if !a.Time.Equal(b.Time) || a.Capacity != b.Capacity || a.Used != b.Used {
+		return false
+	}
+	if !equalStrings(a.QueuedIDs, b.QueuedIDs) || !equalStrings(a.RunningIDs, b.RunningIDs) {
+		return false
+	}
+	if len(a.Jobs) != len(b.Jobs) || len(a.Tenants) != len(b.Tenants) {
+		return false
+	}
+	for i := range a.Jobs {
+		if a.Jobs[i] != b.Jobs[i] {
+			return false
+		}
+	}
+	for i := range a.Tenants {
+		if a.Tenants[i] != b.Tenants[i] {
+			return false
+		}
+	}
+	return reflect.DeepEqual(a.TenantUsed, b.TenantUsed)
 }
 
 func assertSnapshotsDeep(t *testing.T, want, got *Snapshot, what string) {

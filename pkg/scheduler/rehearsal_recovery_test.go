@@ -108,8 +108,10 @@ func logicalTimeAfter(t0 time.Time, evs []RehearsalEvent) time.Time {
 	return now
 }
 
-// reportsEqualForHistory 比较重启后重建的历史报告（重启后 Snapshot 字段为 nil，
-// Submit 指针仅保留 Started）与不中断时的报告。
+// reportsEqualForHistory 严格比较“不中断连续跑完”与“中断续跑”的同一步
+// 步骤报告：事件、逻辑时间、全部调度裁决（含连锁启动/抢占）、提交受理
+// 结果（受理与否、作业副本、Started）、该步生效后的状态快照、业务错误，
+// 任一项不同都视为不一致。
 func reportsEqualForHistory(a, b RehearsalStepReport) bool {
 	if a.Index != b.Index {
 		return false
@@ -123,9 +125,29 @@ func reportsEqualForHistory(a, b RehearsalStepReport) bool {
 	if !decisionsEqual(a.Decisions, b.Decisions) {
 		return false
 	}
-	aStarted := a.Submit != nil && a.Submit.Started
-	bStarted := b.Submit != nil && b.Submit.Started
-	if aStarted != bStarted {
+	// 提交受理结果：被拒的提交两边都必须为 nil；受理的提交逐项一致。
+	if (a.Submit == nil) != (b.Submit == nil) {
+		return false
+	}
+	if a.Submit != nil {
+		if a.Submit.Started != b.Submit.Started {
+			return false
+		}
+		if (a.Submit.Job == nil) != (b.Submit.Job == nil) {
+			return false
+		}
+		if a.Submit.Job != nil && *a.Submit.Job != *b.Submit.Job {
+			return false
+		}
+		if !decisionsEqual([]Decision{a.Submit.Decision}, []Decision{b.Submit.Decision}) {
+			return false
+		}
+		if !decisionsEqual(a.Submit.Decisions, b.Submit.Decisions) {
+			return false
+		}
+	}
+	// 该步生效后的状态快照必须逐项一致（历史步骤能看到当时的状态）。
+	if !snapshotsStrictEqual(a.Snapshot, b.Snapshot) {
 		return false
 	}
 	return errorsEqual(a.Err, b.Err)

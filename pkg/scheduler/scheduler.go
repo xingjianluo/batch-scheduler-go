@@ -299,7 +299,20 @@ func (s *Scheduler) Submit(id, tenantID string, priority int, req Resource) (*Su
 }
 
 // Complete 将运行中作业标记为完成，释放其全部资源占位并触发调度。
+// 返回的裁决仅是“完成”动作本身；需要该操作引发的全部连锁裁决
+// （释放资源后排队作业的启动/抢占/重新入队）时使用 CompleteAll。
 func (s *Scheduler) Complete(jobID string) (*Decision, error) {
+	decisions, err := s.CompleteAll(jobID)
+	if err != nil {
+		return nil, err
+	}
+	return &decisions[0], nil
+}
+
+// CompleteAll 同 Complete，但返回本操作引发的完整裁决序列：
+// decisions[0] 是完成动作本身，其后依次是释放资源连锁触发的
+// 启动（start）、抢占（preempt）等全部调度裁决。
+func (s *Scheduler) CompleteAll(jobID string) ([]Decision, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	job, ok := s.jobs[jobID]
@@ -326,11 +339,23 @@ func (s *Scheduler) Complete(jobID string) (*Decision, error) {
 	if err := s.persistLocked(); err != nil {
 		return nil, err
 	}
-	return &decisions[0], nil
+	return decisions, nil
 }
 
 // Cancel 取消作业：排队中则直接离开队列；运行中则释放资源。终态不可取消。
+// 返回的裁决仅是“取消”动作本身；需要该操作引发的全部连锁裁决
+// （释放资源后排队作业的启动/抢占/重新入队）时使用 CancelAll。
 func (s *Scheduler) Cancel(jobID string) (*Decision, error) {
+	decisions, err := s.CancelAll(jobID)
+	if err != nil {
+		return nil, err
+	}
+	return &decisions[0], nil
+}
+
+// CancelAll 同 Cancel，但返回本操作引发的完整裁决序列：
+// decisions[0] 是取消动作本身，其后依次是连锁触发的全部调度裁决。
+func (s *Scheduler) CancelAll(jobID string) ([]Decision, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	job, ok := s.jobs[jobID]
@@ -359,7 +384,7 @@ func (s *Scheduler) Cancel(jobID string) (*Decision, error) {
 	if err := s.persistLocked(); err != nil {
 		return nil, err
 	}
-	return &decisions[0], nil
+	return decisions, nil
 }
 
 // Get 查询作业当前状态副本。
